@@ -7,6 +7,12 @@
 void printf(const char *fmt, ...);
 void panic(char *s);
 
+// 简单断言：失败则 panic
+static void kassert(int cond, const char *msg) {
+    if (!cond) panic((char*)msg);
+}
+
+// 调试打印映射结果
 static void print_map_result(const char* name, int rc) {
     if (rc == 0) {
         printf("%s: success\n", name);
@@ -15,96 +21,91 @@ static void print_map_result(const char* name, int rc) {
     }
 }
 
+// 物理内存分配器测试
+static void test_physical_memory(void) {
+    printf("[TEST] physical memory...\n");
+    void *page1 = alloc_page();
+    void *page2 = alloc_page();
+    printf("  alloc page1=%p page2=%p\n", page1, page2);
+    kassert((page1 != 0) && (page2 != 0), "alloc_page returned null");
+    kassert(page1 != page2, "alloc_page returned duplicate page");
+    kassert((((uint64)page1 & (PGSIZE-1)) == 0) && (((uint64)page2 & (PGSIZE-1)) == 0),
+            "alloc_page not page-aligned");
+
+    // 写入验证
+    *(int*)page1 = 0x12345678;
+    kassert(*(int*)page1 == 0x12345678, "page write/read failed");
+
+    // 释放并再次分配
+    free_page(page1);
+    printf("  free page1=%p\n", page1);
+    void *page3 = alloc_page();
+    printf("  re-alloc page3=%p\n", page3);
+    kassert(page3 != 0, "alloc_page after free failed");
+
+    // 清理
+    free_page(page2);
+    free_page(page3);
+    printf("  free page2=%p page3=%p\n", page2, page3);
+    printf("[TEST] physical memory passed. free=%d\n", (int)pmm_free_pages());
+}
+
+// 页表功能测试
+static void test_pagetable(void) {
+    printf("[TEST] pagetable...\n");
+    pagetable_t pt = create_pagetable();
+    kassert(pt != 0, "create_pagetable failed");
+
+    uint64 va = 0x1000000UL; // 16MB, 对齐页
+    uint64 pa = (uint64)alloc_page();
+    kassert(pa != 0, "alloc_page for map failed");
+
+    int rc = map_page(pt, va, pa, PTE_R | PTE_W);
+    print_map_result("map basic", rc);
+    kassert(rc == 0, "map_page basic failed");
+
+    // 检查 walk_lookup
+    pte_t *pte = walk_lookup(pt, va);
+    kassert(pte && (*pte & PTE_V), "walk_lookup failed");
+    kassert(PTE_PA(*pte) == pa, "PTE_PA mismatch");
+    kassert((*pte & PTE_R) && (*pte & PTE_W) && !(*pte & PTE_X), "PTE perm mismatch");
+
+    // 重复映射应失败
+    int rc_dup = map_page(pt, va, pa, PTE_R | PTE_W);
+    kassert(rc_dup != 0, "duplicate map should fail");
+
+    dump_pagetable(pt, 2);
+
+    destroy_pagetable(pt);
+    free_page((void*)pa);
+    printf("[TEST] pagetable passed.\n");
+}
+
+// 虚拟内存启用测试
+static void test_virtual_memory(void) {
+    printf("[TEST] virtual memory...\n");
+    printf("Before enabling paging...\n");
+    kvminit();
+    kvminithart();
+    printf("After enabling paging...\n");
+    // 简单访问验证：读取 UART 基址不会异常
+    (void)*(volatile uint8*)UART0;
+    printf("[TEST] virtual memory passed.\n");
+}
+
 // xv6-like kernel entry
 void main(void) {
     printf("xv6-like kernel starting...\n");
 
-    // 1) Initialize PMM and do basic allocation tests
     pmm_init();
     printf("PMM initialized: total=%d pages, free=%d pages\n",
            (int)pmm_total_pages(), (int)pmm_free_pages());
 
-    void *p1 = alloc_page();
-    printf("Allocated one page at %p\n", p1);
-    printf("Free pages now: %d\n", (int)pmm_free_pages());
-
-    void *p4 = alloc_pages(4);
-    printf("Allocated 4 pages starting at %p\n", p4);
-    printf("Free pages now: %d\n", (int)pmm_free_pages());
-
-    free_page(p1);
-    printf("Freed one page, free pages: %d\n", (int)pmm_free_pages());
-
-    // Note: free_page(p4) frees only the first of 4 pages in this simple test
-    free_page(p4);
-    printf("Freed first page of 4-page block, free pages: %d\n", (int)pmm_free_pages());
-
-    // 2) Pagetable creation and mapping tests
-    pagetable_t pt = create_pagetable();
-    if (!pt) panic("create_pagetable failed");
-    printf("Created new pagetable at %p\n", pt);
-
-    // Allocate two physical pages we will map into our pagetable
-    void *kva_a = alloc_page();
-    void *kva_b = alloc_page();
-    if (!kva_a || !kva_b) panic("alloc_page for mapping failed");
-    printf("Mapping test pages: A=%p, B=%p\n", kva_a, kva_b);
-
-    // Choose virtual addresses (page-aligned) to map
-    // Pick a high kernel VA region for testing; adjust if your layout differs
-    uint64 va_base = PGROUNDDOWN(0x40000000UL);
-    uint64 va_a    = va_base;
-    uint64 va_b    = va_base + PGSIZE;
-
-    // Convert kernel VA of allocated pages to PA (based on your mapping macros)
-    uint64 pa_a = KERN_VA2PA((uint64)kva_a);
-    uint64 pa_b = KERN_VA2PA((uint64)kva_b);
-
-    // Permissions: kernel leaf, read-write (no execute, no user)
-    int perms = PTE_R | PTE_W;
-
-    // 2.1 Map first page
-    int rc = map_page(pt, va_a, pa_a, perms);
-    print_map_result("map va_a->pa_a", rc);
-
-    // 2.2 Duplicate map (should fail with conflict)
-    int rc_dup = map_page(pt, va_a, pa_a, perms);
-    print_map_result("duplicate map va_a", rc_dup);
-
-    // 2.3 Map second page next to the first
-    int rc2 = map_page(pt, va_b, pa_b, perms);
-    print_map_result("map va_b->pa_b", rc2);
-
-    // 2.4 Dump pagetable structure
-    printf("Dumping pagetable after mappings:\n");
-    dump_pagetable(pt, 2);
-
-    // 2.5 Optional: probe walk_lookup on mapped and unmapped addresses
-    pte_t* pte_a = walk_lookup(pt, va_a);
-    printf("walk_lookup(va_a): %s, pte=%p\n", pte_a ? "found" : "not found", pte_a);
-
-    pte_t* pte_b = walk_lookup(pt, va_b);
-    printf("walk_lookup(va_b): %s, pte=%p\n", pte_b ? "found" : "not found", pte_b);
-
-    pte_t* pte_c = walk_lookup(pt, va_b + PGSIZE);
-    printf("walk_lookup(va_b+PGSIZE): %s\n", pte_c ? "found" : "not found");
-
-    // 3) Destroy pagetable (frees page table pages; does not free mapped data pages)
-    destroy_pagetable(pt);
-    printf("Pagetable destroyed.\n");
-
-    // Free the data pages we used for mapping
-    free_page(kva_a);
-    free_page(kva_b);
-    printf("Freed mapped data pages. Free pages: %d\n", (int)pmm_free_pages());
+    test_physical_memory();
+    test_pagetable();
+    test_virtual_memory();
 
     printf("Kernel main finished.\n");
-
-    pmm_init();
-    kvminit();
-    kvminithart();
-
-
     for (;;) {
         // idle loop
     }

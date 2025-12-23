@@ -17,6 +17,13 @@ static size_t free_pages_cnt;
 
 extern char end[]; // 内核结束
 
+// 简单合法性校验：物理地址需在可管理区间且页对齐
+static inline int pa_valid(uintptr_t pa) {
+    uintptr_t pa_start = pg_round_up((uintptr_t)end);
+    uintptr_t pa_end   = pg_round_down(PHYSTOP);
+    return (pa >= pa_start) && (pa + PGSIZE <= pa_end) && ((pa & (PGSIZE - 1)) == 0);
+}
+
 void pmm_init(void) {
     initlock(&lock);
     uintptr_t pa_start = pg_round_up((uintptr_t)end);
@@ -43,7 +50,7 @@ void* alloc_page(void) {
 }
 
 void free_page(void* pa) {
-    if(((uintptr_t)pa % PGSIZE) != 0) panic("free_page: not aligned");
+    if(!pa_valid((uintptr_t)pa)) panic("free_page: invalid pa");
     acquire(&lock);
     struct run *r = (struct run*)pa;
     r->next = freelist;

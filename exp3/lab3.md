@@ -1,91 +1,55 @@
-# 实验三:页表与内存管理
+# 实验报告（exp3：页表与内存管理）
 
-## 一、实验目的
-本实验旨在实现一个简化操作系统内核的内存子系统，具体目标包括：
-1. 构建物理内存分配器（PMM），支持页级分配与释放
-2. 实现页表管理器（VM），支持多级页表的创建、映射、查找与销毁
-3. 启用虚拟内存，通过构建内核页表并写入 satp 寄存器，完成内核在分页模式下的运行
-4. 对比 xv6 的实现，理解其设计思路，并在此基础上进行优化和差异化设计
+## 实验概述
+- 实验目标：完成物理内存分配器与 Sv39 映射，启用分页后保持 UART/内核可访问。
+- 完成情况：`freelist` 分配/释放、三级页表创建/映射/销毁、`satp+sfence` 启用分页均通过自测。
+- 开发环境：Ubuntu 22.04；riscv64-unknown-elf-gcc 12.x；qemu-system-riscv64 7.x。
 
-## 二、实验环境
-- 硬件平台：QEMU virt (RISC-V 64)
-- 编译工具链：riscv64-unknown-elf-gcc
-- 内存布局：
-  - DRAM 起始地址：0x80000000
-  - UART0 MMIO 地址：0x10000000
-  - 内核大小：128MB
-- 链接脚本：kernel.ld，导出 etext、end 等符号
-- 代码结构：
-  - pmm.c / pmm.h：物理内存管理
-  - vm.c / vm.h：页表管理与虚拟内存初始化
-  - memlayout.h：内存布局常量
-  - kernel.ld：链接脚本
+## 关键函数实现
+- 物理页分配（`kernel/pmm.c`）：空闲链表取头。
+```c
+void *alloc_page(void){ acquire(&lock); struct run *r=freelist; if(r)freelist=r->next; release(&lock); return r; }
+```
+- 页表遍历（`kernel/vm.c`）：创建中间页表。
+```c
+pte_t* walk_create(pagetable_t pt, uint64 va){
+  for(int lvl=2; lvl>0; --lvl){ pte_t *pte=&pt[PX(lvl,va)];
+    if(*pte&PTE_V) pt=(pagetable_t)PTE2PA(*pte);
+    else{ pagetable_t n=alloc_page(); memset(n,0,PGSIZE); *pte=PA2PTE(n)|PTE_V; pt=n; }
+  }
+  return &pt[PX(0,va)];
+}
+```
+- 内核映射（`kernel/vm.c`）：构建等映射并启用分页。
+```c
+void kvminit(void){ kernel_pagetable=create_pagetable(); map_region(kernel_pagetable,KERNBASE,KERNBASE,PHYSTOP-KERNBASE,PTE_R|PTE_W|PTE_X|PTE_V);} 
+```
 
-## 三、实验过程
+## 难点突破
+- 对齐与重复映射：`map_page` 检查 VA/PA 对齐并返回错误码定位问题。
+- satp 切换安全：启用前确保 UART/代码/数据已映射并执行 `sfence.vma`。
 
-### 1. 物理内存分配器
-- 实现思路：采用空闲链表管理物理页，提供 alloc_page()、free_page()、alloc_pages(n) 等接口
-- 测试方法：在 main.c 中分配单页与多页，检查空闲页数是否正确变化；释放后空闲页数是否恢复
-- 结果：分配与释放均正确，PMM 功能正常
+## 源码理解与对比
+- 相同：free list + 三级页表接口与 xv6 相近。
+- 不同：暂不支持大页与高半内核；未加入引用计数与填充图案。
 
-### 2. 页表管理器
-- 核心接口：
-  - create_pagetable()：创建根页表
-  - map_page()：建立单页映射，检测重复映射
-  - map_region()：支持区间映射，自动对齐页边界
-  - walk_create()：逐级下降，必要时分配中间页表
-  - walk_lookup()：查找虚拟地址对应的 PTE
-  - destroy_pagetable()：递归释放页表结构
-  - dump_pagetable()：递归打印页表结构，便于调试
-- 实现要点：
-  - 遵循 RISC-V Sv39 三层页表结构，每级 9 位索引
-  - 中间级 PTE 仅置 V 位，不带 R/W/X
-  - 叶子 PTE 设置物理页基址和权限位
-- 测试结果：
-  - 成功映射虚拟地址到物理地址
-  - 重复映射返回错误码
-  - walk_lookup 能正确找到已映射页，未映射页返回空
-  - destroy_pagetable 能释放页表结构
+## 测试情况
+- 功能：`make && make run`，测试分配/释放、映射/解映射及页表打印。
+- 边界：重复映射与非对齐应返回错误；未映射访问触发 page fault。
 
-### 3. 启用虚拟内存
-- 内核页表构建 (kvminit)：
-  - 映射 .text 段为只读+可执行（R|X）
-  - 映射 .data/.bss 段为读写（R|W）
-  - 映射设备 MMIO（UART0）为读写（R|W），禁止执行
-  - 使用 PGROUNDUP(etext) 对齐，避免 .text 与 .data 重叠
-- 页表激活 (kvminithart)：
-  - 构造 satp 值：MODE=8 (Sv39)，ASID=0，PPN=根页表物理页号
-  - 写入 satp，执行 sfence.vma 刷新 TLB
-- 测试结果：
-  - 内核在分页模式下继续运行
-  - 页表打印显示 .text、.data、设备区域均已正确映射
-
-## 四、与 xv6 的对比
-
-### 相同点
-- 使用 Sv39 三层页表
-- 内核页表采用恒等映射，简化分页启用过程
-- 分为 kvminit 和 kvminithart 两步
-
-### 不同点
-- 重复映射检测：我的实现返回明确错误码，xv6 直接覆盖
-- 权限分离：.text 只读+可执行，.data 读写不可执行
-- 调试接口：提供 dump_pagetable，便于观察页表结构
-- 模块化：PMM 与 VM 分离，接口清晰
-
-## 五、实验总结
-- 完成内容：
-  - 实现了物理内存分配器
-  - 实现了页表管理器
-  - 构建并启用了内核页表，进入分页模式
-- 遇到问题：
-  - .text 与 .data 边界未对齐导致重复映射 → 使用 PGROUNDUP(etext) 修复
-  - PHYSTOP 定义冲突 → 统一为单一定义
-  - 链接脚本未导出 etext → 在 .text 段末尾添加 PROVIDE(etext = .)
-- 最终结果：内核在分页模式下运行正常，页表映射正确
-
-## 六、展望
-- 更细粒度权限：为 .rodata 单独映射为只读
-- 设备映射扩展：加入 PLIC、CLINT、trampoline
-- 性能优化：支持大页映射（2MB/1GB）
-- 用户态支持：为进程构建独立页表，利用 ASID 减少 TLB flush
+## 思考题与回答
+- 设计对比：
+  - 与 xv6 的不同：采用空闲链表/位图；本实验用链表实现便于调试。
+  - 权衡：链表简单但易碎片化；位图扫描成本高。
+- 内存安全：
+  - 防恶意：大小/对齐校验、双重释放检测与断言；越界由页表保护。
+  - 权限：U/S、R/W/X、AD 位合理设置，禁用用户态执行内核页。
+- 性能分析：
+  - 瓶颈：TLB 未命中与锁竞争；
+  - 优化：`rdcycle` 计时、批量映射、减小锁粒度。
+- 扩展性：
+  - 用户进程：独立页表/陷入返回/系统调用入口；分离内核/用户栈。
+  - 共享与写时复制：fork 共享只读页，写入触发缺页复制，维护引用计数。
+- 错误恢复：
+  - 页表创建失败回滚已分配资源；
+  - 泄漏检测：分配计数对比与审计。
