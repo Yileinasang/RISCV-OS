@@ -1,5 +1,4 @@
-#include <stdarg.h>
-#include <stdint.h>
+#include "types.h"
 
 void consputc(char c);
 

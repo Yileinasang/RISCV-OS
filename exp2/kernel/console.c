@@ -1,4 +1,3 @@
-#include <stdint.h>
 
 void uartputc(char c);
 

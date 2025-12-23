@@ -1,46 +1,51 @@
-## 实验二：内核printf与清屏功能实现
+# 实验报告（exp2：内核 printf 与清屏）
 
+## 实验概述
+- 实验目标：实现内核级 `printf` 与 `clear_screen`，完成基本格式化输出与串口显示。
+- 完成情况：`printf/printint/consputc/uartputc` 正常，ANSI 清屏可用，QEMU 串口输出通过。
+- 开发环境：Ubuntu 22.04；riscv64-unknown-elf-gcc 12.x；qemu-system-riscv64 7.x。
 
+## 关键函数实现
+- 格式化核心（`kernel/printf.c`）：有限状态机解析 `%d/%x/%p/%s/%c/%%`，整数用迭代除基数组装。
+```c
+static void printint(long xx,int base,int sign){
+  char buf[32];int i=0;ulong x=sign&&xx<0?-xx:xx;
+  do{buf[i++]=digits[x%base];x/=base;}while(x!=0);
+  if(sign&&xx<0)buf[i++]='-';
+  while(--i>=0)consputc(buf[i]);
+}
+```
+- 控制台输出（`kernel/console.c`）：处理 CRLF 兼容后写 UART。
+```c
+void consputc(int c){ if(c=='\n') uartputc('\r'); uartputc(c);} 
+```
+- 清屏（`kernel/printf.c`）：发送 ANSI 转义。
+```c
+void clear_screen(void){ printf("\033[2J\033[H"); }
+```
 
+## 难点突破
+- CRLF 兼容：在 `consputc` 对 `\n` 注入 `\r`，适配 nographic 终端。
+- 指针打印：`%p` 固定 16 hex 宽度用于调试地址。
 
-#### 系统设计说明
- **系统架构**
- **模块划分**  
- `uart.c`：硬件层，直接操作 UART  
- `console.c`：控制层，处理换行兼容、封装输出  
- `printf.c`：格式化层，实现 `%d/%x/%s/%c/%p`  
- **核心模块设计**  
- `printint`：将整数转换为字符串，避免递归，处理 INT_MIN  
- `printf`：直接处理可变参数，支持多种格式，不拆分为 vprintf  
- `clear_screen`：输出 ANSI 转义序列 `\033[2J\033[H`  
- `goto_xy`：移动光标  
- `printf_color`：彩色输出  
- **设计决策说明**  
- 为什么需要 console 层？→ 解耦硬件和格式化逻辑，便于扩展  
- 为什么不递归？→ 避免栈消耗，保证裸机环境安全  
- 如何处理 INT_MIN？→ 转为 long，再取负，避免溢出  
- 如何处理 NULL 字符串？→ 输出 "(null)"  
+## 源码理解与对比
+- 相同：最小 printf、串口轮询输出与 xv6 接近。
+- 不同：未加锁（单核场景足够）；清屏走 ANSI 而非显存操作。
 
-#### 实验过程说明
- **实验环境**：QEMU + riscv64-unknown-elf-gcc  
- **步骤与方案**：  
-1. 在实验一基础上新增 console.c  
-2. 实现 printf.c，支持基本格式化  
-3. 扩展清屏、光标移动、彩色输出  
-4. 在 main.c 测试  
- **遇到的问题**  
- `clear_screen` 在 VSCode 终端无效  
- 链接错误：`undefined reference to clear_screen`  
- **解决方案**  
- 换用 Windows Terminal / Linux 原生终端，确认 ANSI 支持  
- 将 `clear_screen` 定义在全局作用域，避免写在函数内部  
+## 测试情况
+- 基本：`make && make run`，查看格式化输出与清屏效果。
+- 边界：为空指针/长字符串/未知格式符验证容错与恢复。
 
-
-
-###  实验测试结果
- **运行结果**
- **覆盖率**：验证了整数、字符串、指针、字符、清屏、光标移动、彩色输出  
- **性能测试**：大量字符串输出正常  
- **运行截图**：QEMU 控制台显示格式化输出和彩色效果（在支持 ANSI 的终端下）  
-
-
+## 思考题与回答
+- 架构设计：
+  - 分层必要：驱动/控制台/格式层解耦，方便扩展与测试。
+  - 多设备：抽象 `console` 设备表，选择路由或广播输出。
+- 算法选择：
+  - 非递归：栈有限；迭代更稳定。
+  - 无除法转换：2/8/16 用位运算；10 进制用 double-dabble/查表。
+- 性能优化：
+  - 瓶颈：MMIO 延迟与解析开销。
+  - 缓冲：环形缓冲 + 批量发送，减少锁竞争。
+- 错误处理：
+  - `NULL`：打印 `(null)`；
+  - 格式错误：原样回退并记录警告。
