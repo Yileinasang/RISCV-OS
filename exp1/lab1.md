@@ -1,44 +1,63 @@
-# 实验报告
+# 实验报告（exp1：RISC-V 引导与裸机启动）
 
-## 实验一：RISC-V引导与裸机启动
+## 实验概述
+- 实验目标：完成裸机引导，建立启动栈，清零 BSS，初始化 UART 并输出可观测信息。
+- 完成情况：`entry.S` 启动序列、`kernel.ld` 链接布局、UART 输出 "Hello OS" 已实现并在 QEMU 运行通过。
+- 开发环境：Ubuntu 22.04；riscv64-unknown-elf-gcc 12.x；qemu-system-riscv64 7.x。
 
+## 关键函数实现
+- 启动入口（`kernel/entry.S`）：设置 `sp` → 清零 BSS → 跳转 C。
+```asm
+_start:
+  la sp, __stack_top
+  la t0, __bss_start
+  la t1, __bss_end
+1:
+  bgeu t0, t1, 2f
+  sd zero, 0(t0)
+  addi t0, t0, 8
+  j 1b
+2:
+  call kernel_main
+```
+- UART 输出（`kernel/uart.c`）：轮询 `LSR_THRE` 后写 `THR`。
+```c
+static void uartputc_sync(int c){
+  while((read_reg(LSR)&LSR_THRE)==0){}
+  write_reg(THR,c);
+}
+```
+- 链接脚本（`kernel/kernel.ld`）：导出栈与 BSS 符号。
+```ld
+PROVIDE(__bss_start = .);
+.bss : { *(.bss .bss.*) *(COMMON) }
+PROVIDE(__bss_end = .);
+.stack : { . = . + 16K; }
+PROVIDE(__stack_top = .);
+```
 
+## 难点突破
+- 早期可观测性：入口先写串口字节，验证取指路径；无输出时排查基址/波特率。
+- 栈与 BSS 边界：用 `objdump -h`/`nm` 验证符号，避免栈覆盖 BSS。
 
-#### 系统设计说明
- **系统架构**  
-CPU 上电 → `_start` (entry.S) → 设置栈 → 清零 BSS → 跳转 `kernel_main` → 调用 `uart_puts` 输出字符串 → 死循环等待  
- **模块划分**  
- `entry.S`：启动入口，初始化栈和 BSS  
- `kernel.ld`：内存布局，定义栈和段地址  
- `uart.c`：UART 驱动，提供 `uart_putc`、`uart_puts`  
- `main.c`：内核入口，调用 UART 输出  
- **核心模块设计**  
- UART 驱动：轮询 LSR 的 THRE 位，确保发送缓冲区空，再写 THR  
- **设计决策说明**  
- 栈大小 16KB，放在内核镜像末尾  
- 必须清零 BSS，保证全局变量符合 C 标准  
- 使用 `-bios none`，完全裸机控制  
+## 源码理解与对比
+- 相同：与 xv6 一样，清 BSS、建栈、跳 C；16550 串口轮询输出。
+- 不同：未启用多核与 S 模式切换；单栈固定大小，分页后需扩展 per-hart 栈与特权切换。
 
-#### 实验过程说明
- **实验环境**：QEMU + riscv64-unknown-elf-gcc  
- **步骤与方案**：  
-1. 编写 entry.S 设置栈和清零 BSS  
-2. 编写 uart.c 驱动  
-3. 编写 main.c 调用 uart_puts 输出  
-4. 链接并运行  
- **遇到的问题**  
- QEMU 占用终端无法退出  
- 输出乱码  
- **解决方案**  
- 使用 `Ctrl+a x` 或 `pkill` 强制退出  
- 确认波特率和寄存器地址，修正为 0x10000000  
+## 测试情况
+- 基本：`make && make run`，串口显示 "Hello OS"。
+- 边界：缩小栈观察溢出风险；注释 BSS 清零观察未定义行为。
 
-
-
-###  实验测试结果
- **运行结果**
- **覆盖率**：验证了启动流程、栈初始化、BSS 清零、UART 输出  
- **性能测试**：简单字符串输出无性能瓶颈  
- **运行截图**：QEMU 控制台显示 "Hello OS"  
-
-
+## 思考题与回答
+- 启动栈的设计：
+  - 大小确定：按调用深度、编译器需求、可能中断与调试余量；取 16KB 便于扩展。
+  - 溢出与检测：会覆盖 BSS/数据区；早期放哨兵检测，分页后在栈下方设不可访问护栏。
+- BSS 段清零：
+  - 不清零现象：全局/静态变量随机值导致逻辑异常或安全隐患。
+  - 可省略：上层引导已保证清零或全部显式初始化，但内核实践中建议始终清零。
+- 与 xv6 的对比：
+  - 简化项：不处理多核 hart、未进入 S 模式、未设置页表与 trampoline。
+  - 风险：开启中断/多核或需要用户态时会成为问题，后续逐步补齐。
+- 错误处理：
+  - UART 失败：降级为静默或回退到 SBI 输出；在出错路径 `wfi` 停驻。
+  - 最小错误显示：提供 MMIO 单字节输出与 `panic()`，循环输出错误码。
